@@ -2,11 +2,12 @@ mod transfer;
 use anchor_lang::{prelude::*, solana_program::program::invoke_signed};
 use anchor_spl::{
     associated_token::AssociatedToken,
-    token::{mint_to, Mint, MintTo, Token, TokenAccount},
+    token::{mint_to, Mint, MintTo, Token, TokenAccount, accessor},
 };
 use mpl_token_metadata::instruction::create_metadata_accounts_v3;
 use pyth_sdk_solana::load_price_feed_from_account_info;
 use std::str::FromStr;
+
 
 declare_id!("6RyrNDYgawQU6e4UxfptWRSZkpnpgMmaXW2N1grkk6ro");
 
@@ -67,15 +68,36 @@ mod copy_invest {
 
         ctx.accounts.support_assets_account.assets = vec![
             Assets {
-                mint_pkey: Pubkey::from_str(WSOL_MINT_ID).unwrap(),
-                price_feed: Pubkey::from_str(SOL_USD_ID).unwrap(),
+                mint_pkey: Pubkey::from_str(WSOL_MINT_ID).unwrap()?,
+                price_feed: Pubkey::from_str(SOL_USD_ID).unwrap()?,
             },
         ];
 
         Ok(())
     }
 
-    pub fn mint_tokens(ctx: Context<MintTokens>, quantity: u64) -> Result<()> {
+    pub fn add_asset(ctx: Context<AddAsset>, mint_pkey: Pubkey, price_feed: Pubkey) -> Result<()> {
+        // max 10 assets
+        if ctx.accounts.support_assets_account.assets.len() >= 10 {
+            return Err(CopyInvestErrorCode::ErrorTooManyAssets.into());
+        }
+        ctx.accounts.support_assets_account.assets.push(Assets {
+            mint_pkey,
+            price_feed,
+        });
+    
+        Ok(())
+    }
+    pub fn deposit(ctx: Context<Deposit>, deposit_params: DepositParams) -> Result<()> {
+        // check the supported assets account
+        if !verify_remain_accounts(&ctx.accounts.support_assets_account, ctx.remaining_accounts) {
+            return Err(CopyInvestErrorCode::ErrUnsupportedAsset.into());
+        }
+        // calculate the fund token price
+        let fund_price = cal_fund_token_price(&ctx.accounts.mint, ctx.remaining_accounts);
+        // calculate the quantity of the fund token
+        let quantity = deposit_params.quantity / fund_price;
+        // mint the fund token to the destination account
         let seeds = &[FUND_MINT_AUTHORITY_SEED, &[*ctx.bumps.get("mint").unwrap()]];
         let signer = [&seeds[..]];
 
@@ -96,27 +118,33 @@ mod copy_invest {
     }
 }
 
-
-/// Calculate the total value of the assets in the fund
-fn cal_assets_value(assets: &Vec<Assets>) -> u64 {
+/// check if the account list is the same as the supported assets
+fn verify_remain_accounts(assets_account: &SupportedAssets, remaining_accounts: &[AccountInfo]) -> bool {
+    // todo: check if the remaining accounts are the same as the supported assets
+    if remaining_accounts.len() != 0 {
+        return false;
+    }
+    true
+}
+/// Calculate the total value of the assets in the fund(0: spl token mint, 1: price feed(pyth), 2: spl token account)
+fn cal_assets_value(assets: &[AccountInfo]) -> u64 {
     let mut total_value: u64 = 0;
-    for asset in assets {
-        let price_account_info = AccountInfo::new_readonly(asset.price_feed, false);
+    let mut index = 0;
+    while index < assets.len() {
+        let price_account_info = &assets[index + 1];
         let price_feed = load_price_feed_from_account_info(price_account_info)?.unwrap();
         let current_timestamp = Clock::get()?.unix_timestamp;
         let current_price = price_feed.get_price_no_older_than(current_timestamp, STALENESS_THRESHOLD).unwrap();
 
         let display_price = u64::try_from(current_price.price).unwrap() / 10u64.pow(u32::try_from(-current_price.expo).unwrap());
         // let display_confidence = u64::try_from(current_price.conf).unwrap() / 10u64.pow(u32::try_from(-current_price.expo).unwrap());
-        total_value += display_price;
+        total_value += display_price * accessor::amount(&assets[index + 2].try_borrow_data()?).unwrap();
     }
     total_value
 }
 
 /// Calculate the fund token price
-fn get_fund_token_price(fund_mint: &Pubkey,assets: &Vec<Assets>) -> u64 {
-    let fund_mint_account_info = AccountInfo::new_readonly(*fund_mint, false);
-    let fund_mint = Mint::unpack(&fund_mint_account_info.data.borrow())?;
+fn cal_fund_token_price(fund_mint: &Mint,assets: &[AccountInfo]) -> u64 {
     let fund_supply = fund_mint.supply;
     if fund_supply == 0 {
         return FUND_NAV_ORIGINAL;
@@ -125,26 +153,6 @@ fn get_fund_token_price(fund_mint: &Pubkey,assets: &Vec<Assets>) -> u64 {
     let fund_price = assets_value / fund_supply;
     // let fund_price = fund_supply / 10u64.pow(u32::try_from(fund_mint.decimals).unwrap());
     fund_price
-}
-
-fn add_asset(ctx: Context<AddAsset>, mint_pkey: Pubkey, price_feed: Pubkey) -> Result<()> {
-    let seeds = &[SUPPORTED_ASSETS_PDA_SEED, &[*ctx.bumps.get("supported_assets").unwrap()]];
-    let signer = [&seeds[..]];
-
-    let account_info = vec![
-        ctx.accounts.support_assets_account.to_account_info(),
-        ctx.accounts.payer.to_account_info(),
-        ctx.accounts.token_program.to_account_info(),
-        ctx.accounts.system_program.to_account_info(),
-        ctx.accounts.rent.to_account_info(),
-    ];
-
-    ctx.accounts.support_assets_account.assets.push(Assets {
-        mint_pkey,
-        price_feed,
-    });
-
-    Ok(())
 }
 
 #[derive(Accounts)]
@@ -181,6 +189,17 @@ pub struct CreateFund<'info> {
     pub token_metadata_program: UncheckedAccount<'info>,
 }
 
+#[derive(Accounts)]
+pub struct AddAsset<'info> {
+    #[account(mut)]
+    pub support_assets_account: Account<'info, SupportedAssets>,
+    #[account(mut)]
+    pub payer: Signer<'info>,
+    pub token_program: Program<'info, Token>,
+    pub system_program: Program<'info, System>,
+    pub rent: Sysvar<'info, Rent>,
+}
+
 #[derive(AnchorSerialize, AnchorDeserialize, Debug, Clone)]
 pub struct CreateFundParams {
     pub name: String,
@@ -189,19 +208,29 @@ pub struct CreateFundParams {
     pub decimals: u8,
 }
 
+#[derive(AnchorSerialize, AnchorDeserialize, Debug, Clone)]
+pub struct DepositParams {
+    pub name: String,
+    pub decimals: u8,
+    pub quantity: u64,
+}
+
 #[account]
 pub struct SupportedAssets {
     pub assets: Vec<Assets>,
 }
 
-#[account]
+#[derive(AnchorSerialize, AnchorDeserialize, Debug, Clone)]
 pub struct Assets {
     pub mint_pkey: Pubkey,
     pub price_feed: Pubkey,
 }
 
 #[derive(Accounts)]
-pub struct MintTokens<'info> {
+#[instruction(
+    params: CreateFundParams
+)]
+pub struct Deposit<'info> {
     #[account(
         mut,
         seeds = [FUND_MINT_AUTHORITY_SEED],
@@ -209,6 +238,11 @@ pub struct MintTokens<'info> {
         mint::authority = mint,
     )]
     pub mint: Account<'info, Mint>,
+    #[account(
+        seeds = [SUPPORTED_ASSETS_PDA_SEED, payer.key().as_bytes(), params.name.as_bytes()],
+        bump,
+    )]
+    pub support_assets_account: Account<'info, SupportedAssets>,
     #[account(
         init_if_needed,
         payer = payer,
@@ -222,4 +256,14 @@ pub struct MintTokens<'info> {
     pub system_program: Program<'info, System>,
     pub token_program: Program<'info, Token>,
     pub associated_token_program: Program<'info, AssociatedToken>,
+}
+
+#[error_code]
+pub enum CopyInvestErrorCode {
+    #[msg("assets max <= 10")]
+    ErrorTooManyAssets,
+    #[msg("UnsupportedAsset")]
+    ErrUnsupportedAsset,
+    #[msg("AccountNotInitialized")]
+    NotInitialized
 }
